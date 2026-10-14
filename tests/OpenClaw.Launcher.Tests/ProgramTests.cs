@@ -371,6 +371,115 @@ public sealed class ProgramTests : IDisposable
         Assert.True(store.IsAcknowledged("logon-manual"));
     }
 
+    [Theory]
+    [InlineData("start", false)]
+    [InlineData("start", true)]
+    [InlineData("restart", false)]
+    [InlineData("restart", true)]
+    public async Task GatewayStartAcknowledgesAnOwnedPendingLaunchWithoutClaimingReadiness(
+        string action,
+        bool json)
+    {
+        SessionRuntime runtime = await SetUpSessionAsync();
+        var clock = new Gateway.AdvancingTimeProvider(DateTimeOffset.UtcNow);
+        new GatewayConfigurationStore(runtime.Paths.GatewayConfigurationPath).Write(
+            new GatewayLaunchConfiguration { Port = 18789 });
+        ConfigureGatewayLaunch((FakeMxcSessionClient)runtime.Backend, new SessionInspectResult
+        {
+            ProcessFound = true,
+            StartTimeMatches = true,
+            SupervisorState = SessionSupervisorStatus.RunningState
+        });
+        using var output = new StringWriter();
+        using var error = new StringWriter();
+
+        int exitCode = await Program.RunControlAsync(
+            CreateSetupOptions(Path.Combine(_testDirectory, "app")),
+            json ? ["gateway-service", action, "--json"] : ["gateway-service", action, "--no-color"],
+            _ => { },
+            output,
+            error,
+            installationLifecycle: new StubbedRecoveryLifecycle(runtime),
+            clock: clock,
+            getLogonSessionId: () => "logon-pending");
+
+        Assert.Equal(0, exitCode);
+        Assert.True(clock.WaitCount > 0);
+        GatewayRecord record = runtime.GatewayState.Read().Record!;
+        Assert.Equal(1234, record.ProcessId);
+        Assert.Equal(18789, record.Port);
+        Assert.False(record.LaunchPending);
+        Assert.Null(record.ObservedPorts);
+        if (json)
+        {
+            using JsonDocument document = JsonDocument.Parse(output.ToString());
+            JsonElement root = document.RootElement;
+            Assert.True(root.GetProperty("ok").GetBoolean());
+            Assert.Equal(1, root.GetProperty("schemaVersion").GetInt32());
+            Assert.Equal($"gateway-service {action}", root.GetProperty("command").GetString());
+            Assert.Equal("isolated-session", root.GetProperty("integration").GetProperty("kind").GetString());
+            Assert.Equal(1, root.GetProperty("integration").GetProperty("version").GetInt32());
+            JsonElement gateway = root.GetProperty("gateway");
+            Assert.Equal("starting", gateway.GetProperty("state").GetString());
+            Assert.False(gateway.TryGetProperty("ownership", out _));
+            Assert.False(gateway.TryGetProperty("url", out _));
+            Assert.False(gateway.TryGetProperty("port", out _));
+            Assert.False(gateway.TryGetProperty("readiness", out _));
+            Assert.False(root.TryGetProperty("companion", out _));
+            Assert.False(root.TryGetProperty("error", out _));
+            Assert.Equal(string.Empty, error.ToString());
+        }
+        else
+        {
+            Assert.Contains("starting", output.ToString(), StringComparison.Ordinal);
+            Assert.Contains("not listening yet", output.ToString(), StringComparison.Ordinal);
+            Assert.Contains("gateway-service status", output.ToString(), StringComparison.Ordinal);
+            Assert.DoesNotContain("Open Control UI", output.ToString(), StringComparison.Ordinal);
+            Assert.Contains("Waiting for the gateway", error.ToString(), StringComparison.Ordinal);
+        }
+    }
+
+    [Theory]
+    [InlineData("start", false)]
+    [InlineData("start", true)]
+    [InlineData("restart", false)]
+    [InlineData("restart", true)]
+    public async Task GatewayStartDoesNotAcknowledgeAnExitedOrUnobservableLaunch(
+        string action,
+        bool inspectionFailed)
+    {
+        SessionRuntime runtime = await SetUpSessionAsync();
+        ConfigureGatewayLaunch((FakeMxcSessionClient)runtime.Backend, new SessionInspectResult
+        {
+            ProcessFound = true,
+            StartTimeMatches = true,
+            SupervisorState = inspectionFailed ? null : SessionSupervisorStatus.ExitedState,
+            SupervisorDetail = inspectionFailed ? null : "the application exited with code 78",
+            Error = inspectionFailed ? "inspection failed" : null
+        });
+        using var output = new StringWriter();
+
+        int exitCode = await Program.RunControlAsync(
+            CreateSetupOptions(Path.Combine(_testDirectory, "app")),
+            ["gateway-service", action, "--json"],
+            _ => { },
+            output,
+            TextWriter.Null,
+            installationLifecycle: new StubbedRecoveryLifecycle(runtime),
+            getLogonSessionId: () => "logon-failed");
+
+        Assert.Equal(1, exitCode);
+        using JsonDocument document = JsonDocument.Parse(output.ToString());
+        JsonElement root = document.RootElement;
+        Assert.False(root.GetProperty("ok").GetBoolean());
+        Assert.False(root.TryGetProperty("gateway", out _));
+        Assert.Contains(
+            inspectionFailed ? "inspection failed" : "exited with code 78",
+            root.GetProperty("error").GetProperty("message").GetString(),
+            StringComparison.Ordinal);
+        Assert.NotNull(runtime.GatewayState.Read().Record);
+    }
+
     [Fact]
     public async Task ManualGatewayRestartAcknowledgesBeforeAStartFailure()
     {
@@ -2864,6 +2973,41 @@ public sealed class ProgramTests : IDisposable
             baseDirectory,
             _ => { },
             backend);
+    }
+
+    private static void ConfigureGatewayLaunch(
+        FakeMxcSessionClient backend,
+        SessionInspectResult inspection)
+    {
+        backend.ExecuteBehavior = _ =>
+        {
+            string workspace = backend.Metadata!.EphemeralWorkspacePath;
+            string? inspectPath = Directory.GetFiles(workspace, "inspect-*.json")
+                .SingleOrDefault(path => !path.EndsWith(".result.json", StringComparison.Ordinal));
+            if (inspectPath is not null)
+            {
+                SessionInspectRequest request = SessionInspectProtocol.ReadRequest(File.ReadAllText(inspectPath));
+                File.WriteAllText(
+                    SessionLaunchProtocol.ResultPathFor(inspectPath),
+                    SessionInspectProtocol.SerializeResult(inspection with { RequestId = request.RequestId }));
+            }
+            else
+            {
+                string requestPath = Directory.GetFiles(workspace, "gateway-*.json")
+                    .Single(path => !path.EndsWith(".result.json", StringComparison.Ordinal));
+                SessionLaunchRequest request = SessionLaunchProtocol.ReadRequest(File.ReadAllText(requestPath));
+                File.WriteAllText(
+                    SessionLaunchProtocol.ResultPathFor(requestPath),
+                    SessionLaunchProtocol.SerializeResult(new SessionLaunchResult
+                    {
+                        RequestId = request.RequestId,
+                        Launched = true,
+                        ProcessId = 1234,
+                        ProcessStartTimeUtc = DateTimeOffset.UtcNow
+                    }));
+            }
+            return Task.FromResult(new MxcExecutionResult(0, string.Empty, string.Empty));
+        };
     }
 
     private async Task<SessionRuntime> SetUpSessionAsync()

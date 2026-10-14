@@ -209,7 +209,14 @@ document.
 
 The wait has a fixed budget. A gateway still coming up when the budget is spent
 is reported as starting rather than failed, and `clawctl gateway-service status`
-will show it once it binds.
+will show it once it binds. For `start` and `restart`, an accepted supervised
+launch whose process identity is verified but has no listener after 90 seconds
+returns exit code 0; JSON reports `ok: true` and `gateway.state: "starting"`.
+This acknowledges the owned launch, not readiness: it reports no port, URL, or
+listener ownership. Clients must continue bounded status polling and verify a
+running listener before using the Gateway or sending credentials. A failed
+inspection, exited process, or conflicting listener does not receive this
+acknowledgement.
 
 `clawctl` reports the gateway port only when it can identify that listener
 unambiguously:

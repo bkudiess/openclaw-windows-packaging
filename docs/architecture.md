@@ -209,6 +209,13 @@ under one lifecycle lock. A missing or already-exited gateway makes the stop a
 no-op and the start continues. If the gateway cannot be confirmed stopped, the
 operation retains its ownership record and does not launch a replacement.
 
+Start and restart wait up to 90 seconds for an owned listener. A verified live
+supervisor with no listener can then return successful acceptance with
+`gateway.state: "starting"`; this is not a running or credential-handoff claim.
+The record remains available for inspection and stop, and clients keep their
+own bounded readiness wait. Inspection failures, terminal supervisor failures,
+and listener conflicts remain unsuccessful starts.
+
 Process access denial is not evidence that a recorded PID belongs to another
 process. Inspection uses query rights instead of requesting a full-access
 handle. If Windows denies inspection or termination, the session helper reads

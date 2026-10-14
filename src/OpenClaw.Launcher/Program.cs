@@ -599,13 +599,15 @@ internal static class Program
 
         int WriteGatewayStartResult(string action, Gateway.GatewayStartResult result)
         {
-            int? port = Gateway.GatewayAddress.ResolvePort(result.Record);
+            int? port = result.State == Gateway.GatewayState.Starting
+                ? null
+                : Gateway.GatewayAddress.ResolvePort(result.Record);
             return WriteResult(new GatewayCommandResult(
                 action,
                 result.State,
                 result.Message,
                 null,
-                result.State == Gateway.GatewayState.Running ? 0 : 1,
+                result.State is Gateway.GatewayState.Running or Gateway.GatewayState.Starting ? 0 : 1,
                 port));
         }
 

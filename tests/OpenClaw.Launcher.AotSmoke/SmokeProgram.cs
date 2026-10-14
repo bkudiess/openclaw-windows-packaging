@@ -57,6 +57,7 @@ internal static class SmokeProgram
             ("Companion snapshot and patch survive NativeAOT", CompanionSnapshotAndPatchAreStructured),
             ("Spectre renders clawctl output under NativeAOT", SpectreOutputRenders),
             ("gateway narration survives NativeAOT", GatewayNarrationRenders),
+            ("pending gateway JSON survives NativeAOT", PendingGatewayJsonIsStructured),
             ("Windows logon identity survives NativeAOT", WindowsLogonIdentityWorks),
             ("Windows process identity survives NativeAOT", WindowsProcessIdentityWorks),
             ("package provenance reads survive NativeAOT", PackageProvenanceReadsBind),
@@ -622,6 +623,35 @@ internal static class SmokeProgram
         Assert(
             result.ToString().Contains("http://127.0.0.1:18789/", StringComparison.Ordinal),
             "The gateway result did not report its URL.");
+    }
+
+    private static Task PendingGatewayJsonIsStructured()
+    {
+        foreach (string action in new[] { "start", "restart" })
+        {
+            using var output = new StringWriter();
+            ClawCtlJson.WriteResult(output, new GatewayCommandResult(
+                action,
+                GatewayState.Starting,
+                "The supervised gateway launch was accepted.",
+                null,
+                0));
+            using JsonDocument document = JsonDocument.Parse(output.ToString());
+            JsonElement root = document.RootElement;
+            JsonElement gateway = root.GetProperty("gateway");
+            Assert(root.GetProperty("ok").GetBoolean(), "An accepted launch was reported as failed.");
+            Assert(root.GetProperty("schemaVersion").GetInt32() == 1, "The JSON schema version changed.");
+            Assert(root.GetProperty("command").GetString() == $"gateway-service {action}",
+                "The accepted launch lost its command identity.");
+            Assert(gateway.GetProperty("state").GetString() == "starting",
+                "The pending gateway state did not survive NativeAOT.");
+            Assert(!gateway.TryGetProperty("port", out _) &&
+                !gateway.TryGetProperty("url", out _) &&
+                !gateway.TryGetProperty("ownership", out _) &&
+                !root.TryGetProperty("error", out _),
+                "Pending acceptance claimed readiness or reported an error.");
+        }
+        return Task.CompletedTask;
     }
 
     private static string StripAnsi(string value)
